@@ -49,15 +49,27 @@ def block_softmax(batch_size, attn, block_mapping):
     # across TPC cores, so we need to split the tensor manually
     # instead of simply doing attn_max = attn.max()
 
+
+    # attn = [n_block, n_h, block_size], all logits has been computed, but they spans on different blocks
     tail_dims = tuple(range(1, attn.dim()))
     attn_max = attn.amax(tail_dims).amax()
     attn.sub_(attn_max)
     attn = attn.exp_()
+    
+
+    # sums = [n_block, n_h], doing reduction inside each block
     sums = attn.sum(dim=-1).unsqueeze(-1)
+    
+    # sums = [bs, n_h], doing reduction on each block
     sums = block2batch(sums, block_mapping)
+
+    # sums = [n_block, n_h], replicates the sum to each blocks 
     sums = batch2block(sums, block_mapping)
     sums.add_(1.0e-12)
+
+    # attn=[n_block, n_h, block_size], compute attn score, the scores are spanning across different blocks
     attn.div_(sums)
+
     return attn
 
 
@@ -68,8 +80,44 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
     q_heads = query.size(1)
     kv_heads = key_cache.size(2)
 
+    # The high level idea of this algorithm can be outlined as follows
+    #   1. fetch key, value cache from paged space to a contiguous space
+    #   2. replicate query to each kv cache block
+    #   3. QK^T within each block
+    #   4. do e^x and first do sum within block, then across blocks within same sequence
+    #   5. compute attn score for each block 
+    #   6. block_v = Score @ V within each block
+    #   7. reduce block_v across block in the same sequence
+    #   8. return result
+    # 
+    # block mapping: block_id -> seq_id one hot encoding
+    # For example, we have two sequence with each with 4 blocks of kv and 3 blocks of kv cache
+    # kv_cache layout would be [seq_0_b_0, seq_0_b_1, seq_0_b_2, seq_0_b_3, seq_1_b_0, seq_1_b_1, seq_1_b_2]
+    #
+    # block mapping before one hot encoding would be
+    # [0, 0, 0, 0, 1, 1, 1]
+    #
+    # block mapping after the one hot encoding would be 
+    # [[1 0]
+    #  [1 0]
+    #  [1 0]
+    #  [1 0]
+    #  [0 1]
+    #  [0 1]
+    #  [0 1]]
+    # 
+    # query = [bs, n_h, 1, h_d]
+    # block_mapping = [n_block, bs] one hot decoding
+    # query2block = block_mapping @ query = [n_block, n_h, 1, h_d],
+    # This operation basically replicates query to each blocks its sequence has.
+    # e.g. the 1st seq has 4 blocks, 2nd seq has 3 blocks with total 7 blocks
+    # the intial query layout woule be [q0, q1]
+    # the final query layout is query = [q0, q0, q0, q0, q1, q1, q1]  
     query = batch2block(scale * query, block_mapping).unsqueeze(-2)
+
+    # key = [n_block, n_h, block_size, h_d]
     key = keys_fetch_func(key_cache, block_list).transpose(1, 2)
+    # value = [n_block, n_h, block_size, h_d]
     value = values_fetch_func(value_cache, block_list).transpose(1, 2)
     block_bias = block_bias.view(key.size(0), 1, 1, -1)
 
@@ -82,9 +130,15 @@ def flat_pa(query, key_cache, value_cache, block_list, block_mapping,
     else:
         key = key.transpose(2, 3)
 
+    # attn = [n_block, n_h, block_size] = [n_block, n_h, 1, h_d] @ [n_block, n_h, block_size, h_d]^T,
+    # all qk logits has been computed, but they spans on different blocks
     attn = matmul_qk_op(query, key) + block_bias
     attn = block_softmax(batch_size, attn, block_mapping)
+
+    # attn = [n_block, n_h, block_size], value = [n_blocks, n_h, block_size, h_d]
+    # attn = attn @ value = [n_block, n_h, h_d], matmul (i.e.) redution inside each block 
     attn = matmul_av_op(attn, value)
+    # attn = [bs, n_h, h_d], reduction across blocks
     attn = block2batch(attn, block_mapping)
     attn = attn.squeeze(-2)
     if kv_heads != q_heads:
